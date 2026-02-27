@@ -33,12 +33,12 @@ conda activate accelsim
 ###############################################################################
 TILE_ROWS=32
 TILE_COLS=32
-THREADS_PER_BLOCK=256
+THREADS_PER_BLOCK=256           # 32=1 warp (best for vector prefetch ILP); 256=8 warps (TLP)
 NUM_BLOCKS=32          # thread blocks (full A100 = 108)
 NUM_TILES=8           # tiles per loop for double buffering
 NUM_LOOPS=4           # outer loop iterations
 NUM_SM_GROUPS=2       # 1=double-buffer (2 SRAM bufs/SM), 2/3=K-group pipeline (1 SRAM buf/SM, K× SMs)
-FILL_CYCLES=1024       # DMA fill cycles per tile (your controllable parameter)
+FILL_CYCLES=2048       # DMA fill cycles per tile (your controllable parameter)
 CLOCK_MHZ=1410        # GPU clock for wall-time estimate
 VECTOR_IN_SRAM=0      # 1=vector slice in SRAM via LDS (~2cy, NO scoreboard/BAR stalls)
                       # 0=vector from DRAM via LDG (~200cy, causes 43% W0_Scoreboard + W32)

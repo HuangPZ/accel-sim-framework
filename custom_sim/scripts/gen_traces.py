@@ -109,6 +109,21 @@ def gen_kernel_trace(args):
     vec_shmem_base = shmem_base + matrix_shmem_bytes  # start of vec slot in shmem
     shmem_bytes = matrix_shmem_bytes + vec_shmem_bytes
 
+    # Register allocation for DRAM vector prefetch:
+    #   R0-R1: temps/address regs
+    #   R2-R5: current matrix element (LDS dest, int128 = 4×32-bit)
+    #   R6-R9: accumulator (int128 = 4×32-bit)
+    #   R10+:  prefetched vector elements (tile_cols × 4 regs each)
+    VEC_REG_BASE = 10
+    if not args.vector_in_sram:
+        nregs = VEC_REG_BASE + args.tile_cols * 4 + 4  # +4 safety
+        assert nregs <= 255, (
+            f"Vector prefetch needs {nregs} regs for tile_cols={args.tile_cols} "
+            f"(max 255). Reduce tile_cols to ≤{(255 - VEC_REG_BASE - 4) // 4}."
+        )
+    else:
+        nregs = 32
+
     # Work distribution: each warp handles some rows within a tile
     rows_per_warp = max(1, args.tile_rows // warps_per_block)
 
@@ -121,7 +136,7 @@ def gen_kernel_trace(args):
     lines.append(f"-grid dim = ({total_blocks},1,1)")
     lines.append(f"-block dim = ({threads_per_block},1,1)")
     lines.append(f"-shmem = {shmem_bytes}")
-    lines.append(f"-nregs = 32")
+    lines.append(f"-nregs = {nregs}")
     lines.append(f"-cuda stream id = 0")
     lines.append(f"-binary version = 80")
     lines.append(f"-enable lineinfo = 0")
@@ -177,59 +192,81 @@ def gen_kernel_trace(args):
                         compute_buf = buf_a_base  # single buffer
 
                     # --- BAR.SYNC: synchronization point ---
-                    # In real execution, this is where we'd wait for DMA fill.
-                    # In simulation, this is ~free (all warps arrive together).
-                    # The actual DMA wait time is added analytically.
                     p = next_pc()
                     warp_insts.append(
                         f"{fmt_pc(p)} {MASK_ALL} 0 BAR.SYNC 0 0"
                     )
 
-                    # --- Compute: matrix tile (SRAM) x vector (DRAM) ---
-                    for row in range(rows_per_warp):
-                        global_row = warp_row_start + row
-                        if global_row >= args.tile_rows:
-                            break
-
+                    if not args.vector_in_sram:
+                        # === DRAM VECTOR: PREFETCH all elements into regs ===
+                        # Issue all tile_cols LDGs back-to-back into R10+.
+                        # By the time compute starts (~tile_cols cycles later),
+                        # L1D hits (~30cy) are covered; cold DRAM miss (~200cy)
+                        # stalls once then all subsequent elements arrive.
                         for col in range(args.tile_cols):
-                            elem_idx = global_row * args.tile_cols + col
-                            shmem_addr = compute_buf + elem_idx * elem_bytes
-
-                            # Vector: shared across groups (same MxV vector)
                             vec_addr = (vector_global_base
                                         + loop_iter * args.tile_cols * elem_bytes
                                         + col * elem_bytes)
-
-                            # LDS: Load matrix element from SRAM (fast, 2 cyc)
+                            vec_reg = VEC_REG_BASE + col * 4
                             p = next_pc()
                             warp_insts.append(
-                                f"{fmt_pc(p)} {MASK_ALL} 1 R2 LDS.128 1 R3 "
-                                f"16 1 {hex(shmem_addr)} 0"
+                                f"{fmt_pc(p)} {MASK_ALL} 1 R{vec_reg} "
+                                f"LDG.E.128 1 R0 16 1 {hex(vec_addr)} 0"
                             )
 
-                            # Vector load: DRAM LDG (~200cy, scoreboard stalls) OR
-                            #              SRAM LDS (~2cy, no stall) via --vector-in-sram
-                            p = next_pc()
-                            if args.vector_in_sram:
-                                # Vector slice was DMA'd into shmem alongside matrix tile
-                                vec_addr = vec_shmem_base + col * elem_bytes
-                                warp_insts.append(
-                                    f"{fmt_pc(p)} {MASK_ALL} 1 R4 LDS.128 1 R5 "
-                                    f"16 1 {hex(vec_addr)} 0"
-                                )
-                            else:
-                                warp_insts.append(
-                                    f"{fmt_pc(p)} {MASK_ALL} 1 R4 LDG.E.128 1 R5 "
-                                    f"16 1 {hex(vec_addr)} 0"
-                                )
+                        # Compute: LDS matrix from SRAM + IMAD with prefetched vec regs
+                        for row in range(rows_per_warp):
+                            global_row = warp_row_start + row
+                            if global_row >= args.tile_rows:
+                                break
+                            for col in range(args.tile_cols):
+                                elem_idx = global_row * args.tile_cols + col
+                                shmem_addr = compute_buf + elem_idx * elem_bytes
+                                vec_reg = VEC_REG_BASE + col * 4
 
-                            # int128 MAC = 4 x int32 IMAD
-                            for part in range(4):
+                                # LDS: matrix element from SRAM (2 cyc)
                                 p = next_pc()
                                 warp_insts.append(
-                                    f"{fmt_pc(p)} {MASK_ALL} 1 R{6 + part} "
-                                    f"IMAD 3 R2 R4 R{6 + part} 0"
+                                    f"{fmt_pc(p)} {MASK_ALL} 1 R2 LDS.128 1 R3 "
+                                    f"16 1 {hex(shmem_addr)} 0"
                                 )
+                                # int128 MAC = 4× IMAD using prefetched vec reg
+                                for part in range(4):
+                                    p = next_pc()
+                                    warp_insts.append(
+                                        f"{fmt_pc(p)} {MASK_ALL} 1 R{6 + part} "
+                                        f"IMAD 3 R2 R{vec_reg + part} R{6 + part} 0"
+                                    )
+                    else:
+                        # === SRAM VECTOR: inline LDS for both operands (no prefetch) ===
+                        for row in range(rows_per_warp):
+                            global_row = warp_row_start + row
+                            if global_row >= args.tile_rows:
+                                break
+                            for col in range(args.tile_cols):
+                                elem_idx = global_row * args.tile_cols + col
+                                shmem_addr = compute_buf + elem_idx * elem_bytes
+                                vec_shmem_addr = vec_shmem_base + col * elem_bytes
+
+                                # LDS: matrix element
+                                p = next_pc()
+                                warp_insts.append(
+                                    f"{fmt_pc(p)} {MASK_ALL} 1 R2 LDS.128 1 R3 "
+                                    f"16 1 {hex(shmem_addr)} 0"
+                                )
+                                # LDS: vector element
+                                p = next_pc()
+                                warp_insts.append(
+                                    f"{fmt_pc(p)} {MASK_ALL} 1 R4 LDS.128 1 R5 "
+                                    f"16 1 {hex(vec_shmem_addr)} 0"
+                                )
+                                # int128 MAC = 4× IMAD
+                                for part in range(4):
+                                    p = next_pc()
+                                    warp_insts.append(
+                                        f"{fmt_pc(p)} {MASK_ALL} 1 R{6 + part} "
+                                        f"IMAD 3 R2 R4 R{6 + part} 0"
+                                    )
 
                 # --- End of one loop: store result to global memory ---
                 # Each group writes to a different output region
@@ -287,8 +324,13 @@ def print_summary(args):
     total_blocks = args.num_blocks * K
     warps = args.threads_per_block // 32
     rows_per_warp = max(1, args.tile_rows // warps)
-    vec_inst = "LDS.128 (~2cy)" if args.vector_in_sram else "LDG.E.128 (~200cy, scoreboard stall)"
-    insts_per_tile_per_warp = rows_per_warp * args.tile_cols * 6 + 1  # LDS+(LDS|LDG)+4xIMAD+BAR
+    if args.vector_in_sram:
+        vec_inst = "LDS.128 (~2cy, inline)"
+        insts_per_tile_per_warp = rows_per_warp * args.tile_cols * 6 + 1  # BAR + R×C×(LDS_mat+LDS_vec+4×IMAD)
+    else:
+        nregs_needed = 10 + args.tile_cols * 4 + 4
+        vec_inst = f"LDG.E.128 → R10..R{10+args.tile_cols*4-1} (prefetch {args.tile_cols} elems, {nregs_needed} regs)"
+        insts_per_tile_per_warp = args.tile_cols + rows_per_warp * args.tile_cols * 5 + 1  # BAR + C×LDG_prefetch + R×C×(LDS_mat+4×IMAD)
 
     mode = "double-buffer (K=1)" if K == 1 else f"{K}-group pipeline"
     print(f"\n{'='*62}")
@@ -320,8 +362,8 @@ def main():
                         help="Matrix tile rows (default: 8)")
     parser.add_argument("--tile-cols", type=int, default=8,
                         help="Matrix tile cols = vector length (default: 8)")
-    parser.add_argument("--threads-per-block", type=int, default=256,
-                        help="Threads per block (default: 256)")
+    parser.add_argument("--threads-per-block", type=int, default=32,
+                        help="Threads per block (default: 32, =1 warp for max prefetch benefit)")
     parser.add_argument("--num-blocks", type=int, default=2,
                         help="Thread blocks (default: 2, full A100=108)")
     parser.add_argument("--num-tiles", type=int, default=4,
