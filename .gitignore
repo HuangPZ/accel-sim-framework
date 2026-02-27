@@ -16,3 +16,10 @@ compile_commands.json
 .cache
 .cursorrules
 CLAUDE.md
+
+# custom_sim: generated outputs (keep scripts/, configs/, run_sim.sh)
+custom_sim/traces/
+custom_sim/run_*/
+custom_sim/zslurm-*.out
+*.out
+.local/bin
