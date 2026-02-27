@@ -20,22 +20,38 @@ Therefore:
     DRAM: [vector]               <- loaded via LDG (goes through real memory hierarchy)
     INT units: 4x IMAD per int128 element
 
-=== GLOBAL SYNCHRONIZATION MODEL ===
-  1. DMA fills Buffer X on ALL SMs simultaneously. Fill starts only after
-     ALL SMs have finished reading Buffer X (global barrier).
-  2. ALL SMs start reading Buffer X only after DMA fill is done.
-  3. Buffers alternate A→B→A→B each tile within a loop.
+=== MODES ===
 
-=== DOUBLE BUFFER TIMELINE (N tiles per loop) ===
-  t=0:           DMA fills Buffer A (tile 0)         [FILL_CYCLES]
-  t=FILL:        ALL SMs read A  +  DMA fills B      [max(FILL, COMPUTE)]
-  t=FILL+max:    ALL SMs read B  +  DMA fills A      [max(FILL, COMPUTE)]
-  ...            (N-1 overlapped phases)
-  t=FILL+(N-1)*max:  ALL SMs read last buffer        [COMPUTE]
+  MODE 1: num_sm_groups=1  (double buffer, single group)
+    1 group of NUM_BLOCKS SMs, each with 2 SRAM buffers.
+    DMA fills buffer B while all SMs compute buffer A, then swaps.
+    Per-tile time = max(FILL, COMPUTE)
 
-  loop_time = FILL + (N-1)*max(FILL,COMPUTE) + COMPUTE
-            = FILL + N*COMPUTE  if compute-bound
-            = N*FILL + COMPUTE  if fill-bound
+    Timeline:
+      t=0:        DMA fills Buffer A (all SMs)          [FILL]
+      t=FILL:     ALL SMs compute A  +  DMA fills B     [max(FILL,COMPUTE)]
+      t=FILL+max: ALL SMs compute B  +  DMA fills A     [max(FILL,COMPUTE)]
+      ...
+
+  MODE 2: num_sm_groups=K  (K-group pipeline, single buffer each)
+    K groups of NUM_BLOCKS SMs, each group with 1 SRAM buffer.
+    DMA serves groups round-robin: fills G0, then G1, ..., then back to G0.
+    While DMA fills group k, all other groups compute.
+
+    Per-tile time per group:
+      fill-bound  (COMPUTE ≤ (K-1)×FILL): K×FILL  (DMA paces everything)
+      compute-bound (COMPUTE > (K-1)×FILL): FILL+COMPUTE
+
+    Total throughput (all groups):
+      fill-bound:    K  / (K×FILL)         = 1/FILL    (same as double-buffer)
+      compute-bound: K  / (FILL+COMPUTE)   > 1/COMPUTE if COMPUTE > FILL
+
+    KEY TRADEOFF vs double-buffer:
+      Double buffer:  1 group, 2× SRAM/SM, per-tile = max(FILL, COMPUTE)
+      K=2 groups:     2× SMs,  1× SRAM/SM, per-tile per-group = FILL+max(FILL,COMPUTE)
+      K=2 total throughput = 2/(FILL+max(FILL,COMPUTE))
+        compute-bound: > 1/COMPUTE when COMPUTE > FILL  ← more useful work done
+        fill-bound:    = 1/FILL (DMA always the bottleneck)
 
 === TRACE STRUCTURE (per thread block) ===
   For each tile iteration:
@@ -61,36 +77,48 @@ import os
 
 
 def gen_kernel_trace(args):
-    """Generate kernel trace with multiple loops of double-buffered compute."""
+    """Generate kernel trace supporting single-group double-buffer or K-group pipeline."""
 
     elem_bytes = 16  # int128 = 16 bytes
+    K = args.num_sm_groups
 
     tile_elems = args.tile_rows * args.tile_cols
 
-    # Shared memory addresses (per SM, private)
+    # Shared memory addresses (per SM, private).
+    # K=1 (double buffer): 2 buffers in SRAM.
+    # K>1 (multi-group):   1 buffer per SM; groups are the pipeline stages.
     shmem_base = 0xFF000000
     buf_a_base = shmem_base
-    buf_b_base = shmem_base + tile_elems * elem_bytes
+    buf_b_base = shmem_base + tile_elems * elem_bytes  # only used when K=1
     local_base = 0xFF800000
 
-    # Global memory: vector in DRAM
+    # Global memory
     vector_global_base = 0x00007F0010000000
+    output_global_base = 0x00007F0020000000
 
     threads_per_block = args.threads_per_block
     warps_per_block = threads_per_block // 32
-    num_blocks = args.num_blocks
+    # Total blocks: K groups × NUM_BLOCKS SMs each
+    total_blocks = args.num_blocks * K
 
-    shmem_bytes = 2 * tile_elems * elem_bytes
+    # SRAM: 2 buffers for double-buffer (K=1), 1 buffer per SM for K>1
+    bufs_per_sm = 2 if K == 1 else 1
+    matrix_shmem_bytes = bufs_per_sm * tile_elems * elem_bytes
+    # Optional: vector slice also in SRAM (eliminates LDG scoreboard stalls)
+    vec_shmem_bytes = args.tile_cols * elem_bytes if args.vector_in_sram else 0
+    vec_shmem_base = shmem_base + matrix_shmem_bytes  # start of vec slot in shmem
+    shmem_bytes = matrix_shmem_bytes + vec_shmem_bytes
 
-    # Work distribution: each warp handles some rows
+    # Work distribution: each warp handles some rows within a tile
     rows_per_warp = max(1, args.tile_rows // warps_per_block)
 
     lines = []
 
     # === Kernel header ===
-    lines.append(f"-kernel name = custom_dma_dbuf_matvec")
+    mode = "double-buffer" if K == 1 else f"{K}-group-pipeline"
+    lines.append(f"-kernel name = custom_dma_{mode}_matvec")
     lines.append(f"-kernel id = 1")
-    lines.append(f"-grid dim = ({num_blocks},1,1)")
+    lines.append(f"-grid dim = ({total_blocks},1,1)")
     lines.append(f"-block dim = ({threads_per_block},1,1)")
     lines.append(f"-shmem = {shmem_bytes}")
     lines.append(f"-nregs = 32")
@@ -120,8 +148,12 @@ def gen_kernel_trace(args):
     MASK_ALL = "ffffffff"
 
     # === Generate per-thread-block traces ===
-    for block_id in range(num_blocks):
+    for block_id in range(total_blocks):
         pc_counter[0] = 0x0010
+
+        # Which SM group this block belongs to, and its index within the group
+        group_id = block_id // args.num_blocks
+        block_in_group = block_id % args.num_blocks
 
         lines.append("#BEGIN_TB")
         lines.append(f"thread block = {block_id},0,0")
@@ -131,22 +163,18 @@ def gen_kernel_trace(args):
 
             warp_row_start = warp_id * rows_per_warp
 
-            # ==============================================================
-            # Loop structure:
-            #   for loop in range(num_loops):
-            #     for tile in range(num_tiles):
-            #       BAR.SYNC  (models sync point where we'd wait for DMA)
-            #       Compute: LDS(matrix) + LDG(vector) + 4xIMAD
-            #     STG (store loop result)
-            # ==============================================================
+            # Each SM group works on a different slice of output rows,
+            # so all K groups produce independent useful output.
+            group_row_offset = group_id * args.tile_rows
 
             for loop_iter in range(args.num_loops):
                 for tile in range(args.num_tiles):
-                    # Pick buffer A or B (alternating)
-                    if tile % 2 == 0:
-                        compute_buf = buf_a_base
+                    # K=1: alternate A/B (double buffer)
+                    # K>1: single buffer per SM (groups are the pipeline stages)
+                    if K == 1:
+                        compute_buf = buf_a_base if tile % 2 == 0 else buf_b_base
                     else:
-                        compute_buf = buf_b_base
+                        compute_buf = buf_a_base  # single buffer
 
                     # --- BAR.SYNC: synchronization point ---
                     # In real execution, this is where we'd wait for DMA fill.
@@ -167,7 +195,7 @@ def gen_kernel_trace(args):
                             elem_idx = global_row * args.tile_cols + col
                             shmem_addr = compute_buf + elem_idx * elem_bytes
 
-                            # Use different vector addresses per loop
+                            # Vector: shared across groups (same MxV vector)
                             vec_addr = (vector_global_base
                                         + loop_iter * args.tile_cols * elem_bytes
                                         + col * elem_bytes)
@@ -179,12 +207,21 @@ def gen_kernel_trace(args):
                                 f"16 1 {hex(shmem_addr)} 0"
                             )
 
-                            # LDG: Load vector element from DRAM
+                            # Vector load: DRAM LDG (~200cy, scoreboard stalls) OR
+                            #              SRAM LDS (~2cy, no stall) via --vector-in-sram
                             p = next_pc()
-                            warp_insts.append(
-                                f"{fmt_pc(p)} {MASK_ALL} 1 R4 LDG.E.128 1 R5 "
-                                f"16 1 {hex(vec_addr)} 0"
-                            )
+                            if args.vector_in_sram:
+                                # Vector slice was DMA'd into shmem alongside matrix tile
+                                vec_addr = vec_shmem_base + col * elem_bytes
+                                warp_insts.append(
+                                    f"{fmt_pc(p)} {MASK_ALL} 1 R4 LDS.128 1 R5 "
+                                    f"16 1 {hex(vec_addr)} 0"
+                                )
+                            else:
+                                warp_insts.append(
+                                    f"{fmt_pc(p)} {MASK_ALL} 1 R4 LDG.E.128 1 R5 "
+                                    f"16 1 {hex(vec_addr)} 0"
+                                )
 
                             # int128 MAC = 4 x int32 IMAD
                             for part in range(4):
@@ -195,13 +232,15 @@ def gen_kernel_trace(args):
                                 )
 
                 # --- End of one loop: store result to global memory ---
+                # Each group writes to a different output region
                 for row in range(rows_per_warp):
                     global_row = warp_row_start + row
                     if global_row >= args.tile_rows:
                         break
-                    result_addr = (0x00007F0020000000
+                    result_addr = (output_global_base
+                                   + group_id * args.num_loops * args.tile_rows * elem_bytes
                                    + loop_iter * args.tile_rows * elem_bytes
-                                   + global_row * elem_bytes)
+                                   + (group_row_offset + global_row) * elem_bytes)
                     p = next_pc()
                     warp_insts.append(
                         f"{fmt_pc(p)} {MASK_ALL} 0 STG.E.128 2 R6 R7 "
@@ -222,9 +261,11 @@ def gen_kernel_trace(args):
 def gen_kernelslist(args):
     """Generate the top-level kernelslist.g file."""
     elem_bytes = 16
+    K = args.num_sm_groups
 
     vector_size = args.num_loops * args.tile_cols * elem_bytes
-    output_size = args.num_loops * args.tile_rows * elem_bytes
+    # K groups each produce num_loops * tile_rows output elements
+    output_size = K * args.num_loops * args.tile_rows * elem_bytes
 
     lines = []
     lines.append(f"MemcpyHtoD,0x00007f0010000000,{vector_size}")
@@ -234,45 +275,41 @@ def gen_kernelslist(args):
 
 
 def print_summary(args):
-    """Print configuration summary and analytical formulas."""
+    """Print configuration summary."""
     elem_bytes = 16
+    K = args.num_sm_groups
     tile_elems = args.tile_rows * args.tile_cols
     total_tiles = args.num_loops * args.num_tiles
-    shmem_per_buf = tile_elems * elem_bytes
-    shmem_total = 2 * shmem_per_buf
-
+    bufs_per_sm = 2 if K == 1 else 1
+    matrix_shmem = bufs_per_sm * tile_elems * elem_bytes
+    vec_shmem = args.tile_cols * elem_bytes if args.vector_in_sram else 0
+    shmem_per_sm = matrix_shmem + vec_shmem
+    total_blocks = args.num_blocks * K
     warps = args.threads_per_block // 32
     rows_per_warp = max(1, args.tile_rows // warps)
-    insts_per_elem = 6  # 1 LDS + 1 LDG + 4 IMAD
-    insts_per_tile_per_warp = rows_per_warp * args.tile_cols * insts_per_elem + 1  # +1 for BAR
+    vec_inst = "LDS.128 (~2cy)" if args.vector_in_sram else "LDG.E.128 (~200cy, scoreboard stall)"
+    insts_per_tile_per_warp = rows_per_warp * args.tile_cols * 6 + 1  # LDS+(LDS|LDG)+4xIMAD+BAR
 
-    print(f"\n{'='*60}")
-    print(f"  SIMULATION CONFIGURATION")
-    print(f"{'='*60}")
-    print(f"  Matrix tile:     {args.tile_rows} x {args.tile_cols} int128 elements")
-    print(f"  Element size:    {elem_bytes} bytes (int128)")
-    print(f"  Tile data:       {shmem_per_buf} bytes per buffer")
-    print(f"  Shared mem:      {shmem_total} bytes (2 buffers)")
-    print(f"  Threads/block:   {args.threads_per_block}")
-    print(f"  Warps/block:     {warps}")
-    print(f"  Rows/warp:       {rows_per_warp}")
-    print(f"  Num blocks:      {args.num_blocks}")
-    print(f"  Tiles/loop:      {args.num_tiles}")
-    print(f"  Num loops:       {args.num_loops}")
-    print(f"  Total tiles:     {total_tiles}")
+    mode = "double-buffer (K=1)" if K == 1 else f"{K}-group pipeline"
+    print(f"\n{'='*62}")
+    print(f"  TRACE CONFIG  [{mode}]")
+    print(f"{'='*62}")
+    print(f"  SM groups:       {K}  ×  {args.num_blocks} SMs  =  {total_blocks} total blocks")
+    print(f"  SRAM / SM:       {shmem_per_sm} bytes  ({bufs_per_sm} matrix buf{'s' if bufs_per_sm>1 else ''}" +
+          (f" + {vec_shmem}B vec slot" if args.vector_in_sram else "") + ")")
+    print(f"  Tile:            {args.tile_rows}×{args.tile_cols} int128  = {tile_elems*elem_bytes} bytes")
+    print(f"  Vector source:   {vec_inst}")
+    print(f"  Tiles/loop:      {args.num_tiles}    Loops: {args.num_loops}    Total tiles/group: {total_tiles}")
     print(f"  Insts/tile/warp: {insts_per_tile_per_warp}")
-    print(f"")
-    print(f"  DOUBLE-BUFFER TIMING FORMULA:")
-    print(f"  {'─'*40}")
-    print(f"  Per loop:")
-    print(f"    loop_time = fill_cycles")
-    print(f"              + num_tiles * max(fill_cycles, compute_per_tile)")
-    print(f"  Total:")
-    print(f"    total = num_loops * loop_time")
-    print(f"")
-    print(f"  After simulation, run:")
-    print(f"    python3 analyze_results.py --sim-log <log> --fill-cycles <N>")
-    print(f"{'='*60}\n")
+    if K == 1:
+        print(f"  Formula:  per-tile = max(FILL, COMPUTE)")
+    else:
+        print(f"  Formula:  per-tile/group = K×FILL if COMPUTE≤(K-1)×FILL (fill-bound)")
+        print(f"                           = FILL+COMPUTE otherwise (compute-bound)")
+        print(f"  Total throughput: {K}×  tiles/cycle across all groups")
+    print(f"\n  After simulation, run:")
+    print(f"    python3 analyze_results.py --sim-log <log> --fill-cycles <N> --num-sm-groups {K}")
+    print(f"{'='*62}\n")
 
 
 def main():
@@ -291,6 +328,11 @@ def main():
                         help="Tiles per loop for double buffering (default: 4)")
     parser.add_argument("--num-loops", type=int, default=3,
                         help="Number of outer loops (default: 3)")
+    parser.add_argument("--num-sm-groups", type=int, default=1,
+                        help="Number of SM groups for pipeline (1=double-buffer, 2/3=K-group; default: 1)")
+    parser.add_argument("--vector-in-sram", action="store_true",
+                        help="Place vector slice in SRAM (LDS ~2cy) instead of DRAM (LDG ~200cy). "
+                             "Eliminates W0_Scoreboard stalls and W32 BAR divergence.")
     parser.add_argument("--outdir", type=str,
                         default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "traces"),
                         help="Output directory")

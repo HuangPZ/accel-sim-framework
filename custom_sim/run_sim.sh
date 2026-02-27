@@ -37,11 +37,20 @@ THREADS_PER_BLOCK=256
 NUM_BLOCKS=32          # thread blocks (full A100 = 108)
 NUM_TILES=8           # tiles per loop for double buffering
 NUM_LOOPS=4           # outer loop iterations
+NUM_SM_GROUPS=2       # 1=double-buffer (2 SRAM bufs/SM), 2/3=K-group pipeline (1 SRAM buf/SM, K× SMs)
 FILL_CYCLES=1024       # DMA fill cycles per tile (your controllable parameter)
 CLOCK_MHZ=1410        # GPU clock for wall-time estimate
+VECTOR_IN_SRAM=0      # 1=vector slice in SRAM via LDS (~2cy, NO scoreboard/BAR stalls)
+                      # 0=vector from DRAM via LDG (~200cy, causes 43% W0_Scoreboard + W32)
 
 # Quick-test override: uncomment to use a tiny config (~5K lines, fast sim)
-# TILE_ROWS=8; TILE_COLS=8; NUM_BLOCKS=2; NUM_TILES=2; NUM_LOOPS=2
+# TILE_ROWS=8; TILE_COLS=8; NUM_BLOCKS=2; NUM_TILES=2; NUM_LOOPS=2; NUM_SM_GROUPS=1
+
+# FAST-SIM override: all blocks do identical work, so reduce blocks+loops for speed.
+# Cycles-per-tile result is unchanged; analyze_results.py extrapolates throughput.
+# Typical speedup: 16x-32x vs full config.
+# UNCOMMENT to enable:
+# NUM_BLOCKS=2; NUM_LOOPS=1
 
 ###############################################################################
 # Step 1: Generate traces (always regenerate fresh — never use stale traces)
@@ -56,6 +65,8 @@ python3 $CUSTOM_DIR/scripts/gen_traces.py \
     --num-blocks $NUM_BLOCKS \
     --num-tiles $NUM_TILES \
     --num-loops $NUM_LOOPS \
+    --num-sm-groups $NUM_SM_GROUPS \
+    $([ "$VECTOR_IN_SRAM" = "1" ] && echo --vector-in-sram) \
     --outdir $CUSTOM_DIR/traces
 
 echo ""
@@ -110,6 +121,7 @@ $ACCEL_SIM_BIN \
     -trace $CUSTOM_DIR/traces/kernelslist.g \
     -config gpgpusim.config \
     -config trace.config \
+    -gpgpu_max_completed_cta $((NUM_BLOCKS * NUM_SM_GROUPS)) \
     2>&1 | tee sim_output.log
 
 ###############################################################################
@@ -140,6 +152,7 @@ python3 $CUSTOM_DIR/scripts/analyze_results.py \
     --clock-mhz $CLOCK_MHZ \
     --tile-rows $TILE_ROWS \
     --tile-cols $TILE_COLS \
-    --num-blocks $NUM_BLOCKS
+    --num-blocks $NUM_BLOCKS \
+    --num-sm-groups $NUM_SM_GROUPS
 
 echo "Done. All outputs in: $RUN_DIR"
