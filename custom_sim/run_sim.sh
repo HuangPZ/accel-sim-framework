@@ -40,7 +40,8 @@ NUM_LOOPS=4           # outer loop iterations
 NUM_SM_GROUPS=2       # 1=double-buffer (2 SRAM bufs/SM), 2/3=K-group pipeline (1 SRAM buf/SM, K× SMs)
 FILL_CYCLES=2048       # DMA fill cycles per tile (your controllable parameter)
 CLOCK_MHZ=1410        # GPU clock for wall-time estimate
-VECTOR_IN_SRAM=0      # 1=vector slice in SRAM via LDS (~2cy, NO scoreboard/BAR stalls)
+GPU_TYPE=a100         # a100 or v100 (selects config files + trace binary_version)
+VECTOR_IN_SRAM=0      # 1=vector slice in SRAM via LDS (~20cy, NO scoreboard/BAR stalls)
                       # 0=vector from DRAM via LDG (~200cy, causes 43% W0_Scoreboard + W32)
 
 # Quick-test override: uncomment to use a tiny config (~5K lines, fast sim)
@@ -67,6 +68,7 @@ python3 $CUSTOM_DIR/scripts/gen_traces.py \
     --num-loops $NUM_LOOPS \
     --num-sm-groups $NUM_SM_GROUPS \
     $([ "$VECTOR_IN_SRAM" = "1" ] && echo --vector-in-sram) \
+    --gpu $GPU_TYPE \
     --outdir $CUSTOM_DIR/traces
 
 echo ""
@@ -107,9 +109,17 @@ mkdir -p $RUN_DIR
 
 echo "Run directory: $RUN_DIR"
 
-# The simulator expects configs in the working directory
-cp $CUSTOM_DIR/configs/gpgpusim.config $RUN_DIR/
-cp $CUSTOM_DIR/configs/trace.config $RUN_DIR/
+# Select config files based on GPU_TYPE
+if [ "$GPU_TYPE" = "v100" ]; then
+    GPGPUSIM_CFG=$CUSTOM_DIR/configs/gpgpusim.v100.config
+    TRACE_CFG=$CUSTOM_DIR/configs/trace.v100.config
+else
+    GPGPUSIM_CFG=$CUSTOM_DIR/configs/gpgpusim.config
+    TRACE_CFG=$CUSTOM_DIR/configs/trace.config
+fi
+
+cp $GPGPUSIM_CFG $RUN_DIR/gpgpusim.config
+cp $TRACE_CFG $RUN_DIR/trace.config
 
 cd $RUN_DIR
 

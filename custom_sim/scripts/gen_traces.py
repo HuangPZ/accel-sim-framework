@@ -127,6 +127,10 @@ def gen_kernel_trace(args):
     # Work distribution: each warp handles some rows within a tile
     rows_per_warp = max(1, args.tile_rows // warps_per_block)
 
+    # GPU binary version mapping
+    gpu_binary_versions = {"a100": 80, "v100": 70}
+    binary_version = gpu_binary_versions.get(args.gpu, 80)
+
     lines = []
 
     # === Kernel header ===
@@ -138,7 +142,7 @@ def gen_kernel_trace(args):
     lines.append(f"-shmem = {shmem_bytes}")
     lines.append(f"-nregs = {nregs}")
     lines.append(f"-cuda stream id = 0")
-    lines.append(f"-binary version = 80")
+    lines.append(f"-binary version = {binary_version}")
     lines.append(f"-enable lineinfo = 0")
     lines.append(f"-accelsim tracer version = 3")
     lines.append(f"-shmem base_addr = {hex(shmem_base)}")
@@ -375,6 +379,8 @@ def main():
     parser.add_argument("--vector-in-sram", action="store_true",
                         help="Place vector slice in SRAM (LDS ~2cy) instead of DRAM (LDG ~200cy). "
                              "Eliminates W0_Scoreboard stalls and W32 BAR divergence.")
+    parser.add_argument("--gpu", type=str, default="a100", choices=["a100", "v100"],
+                        help="Target GPU for binary_version in trace header (default: a100)")
     parser.add_argument("--outdir", type=str,
                         default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "traces"),
                         help="Output directory")
