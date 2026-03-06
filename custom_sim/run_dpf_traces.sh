@@ -1,12 +1,14 @@
 #!/bin/bash
 #SBATCH -J accelsim_dpf
+#SBATCH --mail-type=END
+#SBATCH --mail-user=ph448@cornell.edu
 #SBATCH -o ./custom_sim/zslurm-%j.out
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=4
+#SBATCH --cpus-per-task=8
 #SBATCH --tasks-per-node=1
 #SBATCH --get-user-env
-#SBATCH --mem 50G
+#SBATCH --mem 70G
 #SBATCH -t 48:00:00
 #SBATCH --requeue
 #SBATCH --partition=suh
@@ -25,9 +27,9 @@ ACCEL_SIM_BIN=$ACCELSIM_DIR/gpu-simulator/bin/release/accel-sim.out
 
 # NVBit trace directory (pre-generated — skip trace generation)
 TRACE_DIR=/share/suh-scrap2/ph448/work/GPU-DPF/nvbit_traces/DPF_HYBRID_KK16384_NN32_MM1_SALSA20_12_CIPHER_matmul0_fuse0
-# Use the original kernelslist directly — trace_parser.cc prepends its own
-# directory to bare filenames, so the file must sit next to the .trace.xz files.
-KERNELSLIST=$TRACE_DIR/kernelslist_ctx_0x6214e2416fb0
+# Use the post-processed kernelslist.g which references .traceg.xz files
+# (the format accel-sim expects with #BEGIN_TB/#END_TB block markers).
+KERNELSLIST=$TRACE_DIR/kernelslist.g
 
 # GPU config: SM80 A100
 GPGPUSIM_CFG=$ACCELSIM_DIR/gpu-simulator/gpgpu-sim/configs/tested-cfgs/SM80_A100/gpgpusim.config
@@ -72,7 +74,7 @@ cat $KERNELSLIST
 ###############################################################################
 echo ""
 echo "=== Step 4: Running Accel-Sim ==="
-cd $RUN_DIR
+cd $RUN_DIR 
 
 echo "Running: $ACCEL_SIM_BIN -trace $KERNELSLIST -config gpgpusim.config -config trace.config"
 echo ""
