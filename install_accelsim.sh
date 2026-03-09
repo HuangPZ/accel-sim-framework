@@ -29,35 +29,35 @@ CONDA_ENV_NAME=accelsim
 echo "=== Checking CUDA ==="
 nvcc --version || { echo "ERROR: nvcc not found at $CUDA_INSTALL_PATH"; exit 1; }
 
-###############################################################################
-# 2. Create conda environment with all build dependencies
-#    (no sudo needed — everything comes from conda-forge)
-###############################################################################
-echo "=== Setting up conda environment ==="
+# ###############################################################################
+# # 2. Create conda environment with all build dependencies
+# #    (no sudo needed — everything comes from conda-forge)
+# ###############################################################################
+# echo "=== Setting up conda environment ==="
 
-# Initialize conda for this shell
-eval "$(conda shell.bash hook)"
+# # Initialize conda for this shell
+# eval "$(conda shell.bash hook)"
 
-# Create env if it doesn't exist
-if ! conda info --envs | grep -q "^${CONDA_ENV_NAME} "; then
-    conda create -n $CONDA_ENV_NAME python=3.10 -y
-fi
-conda activate $CONDA_ENV_NAME
+# # Create env if it doesn't exist
+# if ! conda info --envs | grep -q "^${CONDA_ENV_NAME} "; then
+#     conda create -n $CONDA_ENV_NAME python=3.10 -y
+# fi
+# conda activate $CONDA_ENV_NAME
 
-# Install C/C++ build dependencies from conda-forge
-# These provide the -dev/-devel headers that accel-sim needs
-conda install -c conda-forge -y \
-    zlib \
-    boost-cpp \
-    libxml2 \
-    bison \
-    flex \
-    mesalib \
-    xorg-libx11 \
-    openssl
+# # Install C/C++ build dependencies from conda-forge
+# # These provide the -dev/-devel headers that accel-sim needs
+# conda install -c conda-forge -y \
+#     zlib \
+#     boost-cpp \
+#     libxml2 \
+#     bison \
+#     flex \
+#     mesalib \
+#     xorg-libx11 \
+#     openssl
 
-# Install Python dependencies
-pip install -r $ACCELSIM_DIR/requirements.txt
+# # Install Python dependencies
+# pip install -r $ACCELSIM_DIR/requirements.txt
 
 ###############################################################################
 # 3. Export include/lib paths so the build can find conda-installed libs

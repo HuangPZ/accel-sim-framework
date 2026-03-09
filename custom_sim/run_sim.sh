@@ -29,6 +29,26 @@ eval "$(conda shell.bash hook)"
 conda activate accelsim
 
 ###############################################################################
+# Build Accel-Sim (picks up any C++ changes since last build)
+###############################################################################
+export CPATH=$CONDA_PREFIX/include:$CPATH
+export LIBRARY_PATH=$CONDA_PREFIX/lib:$LIBRARY_PATH
+export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
+export PATH=$ACCELSIM_DIR/.local/bin:$PATH
+
+cd $ACCELSIM_DIR/gpu-simulator
+export GPGPUSIM_REPO=https://github.com/accel-sim/gpgpu-sim_distribution.git
+export GPGPUSIM_BRANCH=dev
+source setup_environment.sh
+
+echo "=== Rebuilding Accel-Sim (clean build to pick up header changes) ==="
+make clean -C gpgpu-sim 2>/dev/null || true
+make -j$(nproc)
+echo "=== Build done: $(ls -lh $ACCEL_SIM_BIN | awk '{print $5, $6, $7, $8}') ==="
+
+cd $ACCELSIM_DIR
+
+###############################################################################
 # Configuration — adjust these parameters
 ###############################################################################
 TILE_ROWS=32
@@ -43,6 +63,10 @@ CLOCK_MHZ=1410        # GPU clock for wall-time estimate
 GPU_TYPE=a100         # a100 or v100 (selects config files + trace binary_version)
 VECTOR_IN_SRAM=0      # 1=vector slice in SRAM via LDS (~20cy, NO scoreboard/BAR stalls)
                       # 0=vector from DRAM via LDG (~200cy, causes 43% W0_Scoreboard + W32)
+MATRIX_PATH=noc   # instant=LDS from per-SM shared memory (fast, no NoC contention)
+                      # noc=LDG.E.128.BYPASS through NoC to custom SRAM at memory controller
+                      #     (models realistic NoC congestion + configurable SRAM latency)
+SRAM_LATENCY=20       # Custom SRAM access latency in cycles (only used when MATRIX_PATH=noc)
 
 # Quick-test override: uncomment to use a tiny config (~5K lines, fast sim)
 # TILE_ROWS=8; TILE_COLS=8; NUM_BLOCKS=2; NUM_TILES=2; NUM_LOOPS=2; NUM_SM_GROUPS=1
@@ -68,6 +92,7 @@ python3 $CUSTOM_DIR/scripts/gen_traces.py \
     --num-loops $NUM_LOOPS \
     --num-sm-groups $NUM_SM_GROUPS \
     $([ "$VECTOR_IN_SRAM" = "1" ] && echo --vector-in-sram) \
+    --matrix-path $MATRIX_PATH \
     --gpu $GPU_TYPE \
     --outdir $CUSTOM_DIR/traces
 
@@ -123,8 +148,24 @@ cp $TRACE_CFG $RUN_DIR/trace.config
 
 cd $RUN_DIR
 
+# Compute SRAM config for NOC matrix path
+SRAM_ARGS=""
+if [ "$MATRIX_PATH" = "noc" ]; then
+    ELEM_BYTES=16
+    TILE_ELEMS=$((TILE_ROWS * TILE_COLS))
+    if [ "$NUM_SM_GROUPS" = "1" ]; then
+        BUFS=2
+    else
+        BUFS=1
+    fi
+    SRAM_SIZE=$((BUFS * TILE_ELEMS * ELEM_BYTES))
+    SRAM_BASE=$((0x7F0030000000))  # must match matrix_sram_base in gen_traces.py
+    SRAM_ARGS="-gpgpu_custom_sram_enabled 1 -gpgpu_custom_sram_latency $SRAM_LATENCY -gpgpu_custom_sram_base_addr $SRAM_BASE -gpgpu_custom_sram_size $SRAM_SIZE"
+    echo "Custom SRAM: enabled, latency=${SRAM_LATENCY}cy, base=0x7F0030000000, size=${SRAM_SIZE}B"
+fi
+
 echo ""
-echo "Running: $ACCEL_SIM_BIN -trace $CUSTOM_DIR/traces/kernelslist.g -config gpgpusim.config -config trace.config"
+echo "Running: $ACCEL_SIM_BIN -trace $CUSTOM_DIR/traces/kernelslist.g -config gpgpusim.config -config trace.config $SRAM_ARGS"
 echo ""
 
 $ACCEL_SIM_BIN \
@@ -132,6 +173,7 @@ $ACCEL_SIM_BIN \
     -config gpgpusim.config \
     -config trace.config \
     -gpgpu_max_completed_cta $((NUM_BLOCKS * NUM_SM_GROUPS)) \
+    $SRAM_ARGS \
     2>&1 | tee sim_output.log
 
 ###############################################################################

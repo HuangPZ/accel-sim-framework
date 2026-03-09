@@ -1,0 +1,122 @@
+# This is a basic workflow to help you get started with Actions
+
+name: CI Tests
+
+# Controls when the workflow will run
+on:
+  push:
+    branches-ignore:
+      - "gh-readonly-queue**"
+  pull_request:
+  # Allows you to run this workflow manually from the Actions tab
+  workflow_dispatch:
+
+# A workflow run is made up of one or more jobs that can run sequentially or in parallel
+jobs:
+  check-format:
+    runs-on: tgrogers-raid
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Check code formatting
+        run: |
+          # Run the formatter to see if it would make any changes
+          /bin/bash ./format-code.sh
+          
+          # Check if there are any uncommitted changes
+          if git diff --quiet; then
+            echo "✅ Code is properly formatted"
+          else
+            echo "❌ Code formatting check failed. The following files need formatting:"
+            git diff --name-only
+            echo ""
+            echo "Please run the formatter locally and commit the changes:"
+            echo "/bin/bash ./format-code.sh"
+            exit 1
+          fi
+
+  build-Makefile:
+    # minimal tests - Makefile is deprecated
+    strategy:
+      matrix:
+        config:
+          - QV100
+        image_tags:
+          - ubuntu-24.04-cuda-12.8-minimal
+    runs-on: ubuntu-latest
+    needs: check-format
+    name: build-Makefile
+    container:
+      image: ghcr.io/accel-sim/accel-sim-framework:${{ matrix.image_tags }}
+      env:
+        CONFIG: ${{ matrix.config }}
+        
+    # Steps represent a sequence of tasks that will be executed as part of the job
+    steps:
+      # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
+      - uses: actions/checkout@v4
+      - name: Run Simulation
+        run: /bin/bash $GITHUB_WORKSPACE/short-tests.sh
+
+  build-CMake:
+    strategy:
+      matrix:
+        app:
+          - rodinia_2.0-ft
+        config:
+          - TITANV
+          - TITANV-LOCALXBAR
+          - QV100
+          - RTX2060
+          - RTX3070
+        image_tags:
+          - ubuntu-24.04-cuda-12.8-minimal
+          - ubuntu-22.04-cuda-11.7.1-minimal
+    runs-on: ubuntu-latest
+    needs: check-format
+    name: build-CMake
+    container:
+      image: ghcr.io/accel-sim/accel-sim-framework:${{ matrix.image_tags }}
+      env:
+        CONFIG: ${{ matrix.config }}
+        APP: ${{ matrix.app }}
+        
+    # Steps represent a sequence of tasks that will be executed as part of the job
+    steps:
+      # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
+      - uses: actions/checkout@v4
+      - name: Run Simulation
+        run: /bin/bash $GITHUB_WORKSPACE/short-tests-cmake.sh
+
+  build-AccelSim:
+    strategy:
+      matrix:
+        image_tags:
+          - ubuntu-24.04-cuda-12.8-minimal
+          - ubuntu-22.04-cuda-11.7.1-minimal
+    runs-on: ubuntu-latest
+    needs: check-format
+    name: build-AccelSim
+    container:
+      image: ghcr.io/accel-sim/accel-sim-framework:${{ matrix.image_tags }}
+      env:
+        ACCELSIM_REPO: https://github.com/accel-sim/accel-sim-framework.git
+        ACCELSIM_BRANCH: dev
+        
+    # Steps represent a sequence of tasks that will be executed as part of the job
+    steps:
+      # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
+      - uses: actions/checkout@v4
+      - name: Run Simulation
+        run: /bin/bash $GITHUB_WORKSPACE/short-tests-accelsim.sh
+
+  CI-Success:
+    runs-on: ubuntu-latest
+    needs: [check-format, build-Makefile, build-CMake, build-AccelSim]
+    steps:
+      - run: |
+          echo "✅ All CI tests completed successfully!"
+          echo "Format check: ✅"
+          echo "Makefile build: ✅"
+          echo "CMake build: ✅"
+          echo "AccelSim build: ✅"

@@ -96,32 +96,50 @@ def gen_kernel_trace(args):
     vector_global_base = 0x00007F0010000000
     output_global_base = 0x00007F0020000000
 
+    # Custom SRAM at memory controller (for --matrix-path noc)
+    matrix_sram_base = 0x00007F0030000000
+    matrix_sram_buf_a = 0  # offset within SRAM range
+    matrix_sram_buf_b = tile_elems * elem_bytes  # only used when K=1
+
+    matrix_via_noc = (args.matrix_path == 'noc')
+
     threads_per_block = args.threads_per_block
     warps_per_block = threads_per_block // 32
     # Total blocks: K groups × NUM_BLOCKS SMs each
     total_blocks = args.num_blocks * K
 
-    # SRAM: 2 buffers for double-buffer (K=1), 1 buffer per SM for K>1
-    bufs_per_sm = 2 if K == 1 else 1
-    matrix_shmem_bytes = bufs_per_sm * tile_elems * elem_bytes
+    if matrix_via_noc:
+        # NOC path: matrix goes through NoC → memory controller → custom SRAM
+        # Shared memory only used for vector (if vector_in_sram)
+        bufs_per_sm = 2 if K == 1 else 1
+        matrix_shmem_bytes = 0  # matrix NOT in shared memory
+        matrix_sram_size = bufs_per_sm * tile_elems * elem_bytes
+    else:
+        # INSTANT path: matrix in shared memory (LDS)
+        bufs_per_sm = 2 if K == 1 else 1
+        matrix_shmem_bytes = bufs_per_sm * tile_elems * elem_bytes
+        matrix_sram_size = 0
+
     # Optional: vector slice also in SRAM (eliminates LDG scoreboard stalls)
     vec_shmem_bytes = args.tile_cols * elem_bytes if args.vector_in_sram else 0
     vec_shmem_base = shmem_base + matrix_shmem_bytes  # start of vec slot in shmem
     shmem_bytes = matrix_shmem_bytes + vec_shmem_bytes
 
-    # Register allocation for DRAM vector prefetch:
+    # Register allocation:
     #   R0-R1: temps/address regs
-    #   R2-R5: current matrix element (LDS dest, int128 = 4×32-bit)
+    #   R2-R5: current matrix element (load dest, int128 = 4×32-bit)
     #   R6-R9: accumulator (int128 = 4×32-bit)
-    #   R10+:  prefetched vector elements (tile_cols × 4 regs each)
+    #   R10+:  prefetched vector elements (only for instant + DRAM vector)
     VEC_REG_BASE = 10
-    if not args.vector_in_sram:
+    if not matrix_via_noc and not args.vector_in_sram:
+        # INSTANT path with DRAM vector: prefetch all vector elements into regs
         nregs = VEC_REG_BASE + args.tile_cols * 4 + 4  # +4 safety
         assert nregs <= 255, (
             f"Vector prefetch needs {nregs} regs for tile_cols={args.tile_cols} "
             f"(max 255). Reduce tile_cols to ≤{(255 - VEC_REG_BASE - 4) // 4}."
         )
     else:
+        # NOC path or vector-in-sram: no prefetch, all loads inline
         nregs = 32
 
     # Work distribution: each warp handles some rows within a tile
@@ -192,8 +210,10 @@ def gen_kernel_trace(args):
                     # K>1: single buffer per SM (groups are the pipeline stages)
                     if K == 1:
                         compute_buf = buf_a_base if tile % 2 == 0 else buf_b_base
+                        sram_buf_offset = matrix_sram_buf_a if tile % 2 == 0 else matrix_sram_buf_b
                     else:
                         compute_buf = buf_a_base  # single buffer
+                        sram_buf_offset = matrix_sram_buf_a
 
                     # --- BAR.SYNC: synchronization point ---
                     p = next_pc()
@@ -201,7 +221,53 @@ def gen_kernel_trace(args):
                         f"{fmt_pc(p)} {MASK_ALL} 0 BAR.SYNC 0 0"
                     )
 
-                    if not args.vector_in_sram:
+                    if matrix_via_noc:
+                        # === NOC MATRIX PATH ===
+                        # Matrix loads go through NoC → memory controller → custom SRAM
+                        # using LDG.E.128.BYPASS (bypasses L1D and L2, served by custom SRAM)
+                        for row in range(rows_per_warp):
+                            global_row = warp_row_start + row
+                            if global_row >= args.tile_rows:
+                                break
+                            for col in range(args.tile_cols):
+                                elem_idx = global_row * args.tile_cols + col
+                                mat_addr = matrix_sram_base + sram_buf_offset + elem_idx * elem_bytes
+
+                                # LDG.E.128.BYPASS: matrix from custom SRAM via NoC
+                                p = next_pc()
+                                warp_insts.append(
+                                    f"{fmt_pc(p)} {MASK_ALL} 1 R2 "
+                                    f"LDG.E.128.BYPASS 1 R0 16 1 {hex(mat_addr)} 0"
+                                )
+
+                                if args.vector_in_sram:
+                                    # LDS: vector element from shared memory
+                                    vec_shmem_addr = vec_shmem_base + col * elem_bytes
+                                    p = next_pc()
+                                    warp_insts.append(
+                                        f"{fmt_pc(p)} {MASK_ALL} 1 R4 LDS.128 1 R5 "
+                                        f"16 1 {hex(vec_shmem_addr)} 0"
+                                    )
+                                else:
+                                    # LDG.E.128: vector from DRAM (through full hierarchy)
+                                    vec_addr = (vector_global_base
+                                                + loop_iter * args.tile_cols * elem_bytes
+                                                + col * elem_bytes)
+                                    p = next_pc()
+                                    warp_insts.append(
+                                        f"{fmt_pc(p)} {MASK_ALL} 1 R4 "
+                                        f"LDG.E.128 1 R1 16 1 {hex(vec_addr)} 0"
+                                    )
+
+                                # int128 MAC = 4× IMAD
+                                for part in range(4):
+                                    p = next_pc()
+                                    warp_insts.append(
+                                        f"{fmt_pc(p)} {MASK_ALL} 1 R{6 + part} "
+                                        f"IMAD 3 R2 R4 R{6 + part} 0"
+                                    )
+
+                    elif not args.vector_in_sram:
                         # === DRAM VECTOR: PREFETCH all elements into regs ===
                         # Issue all tile_cols LDGs back-to-back into R10+.
                         # By the time compute starts (~tile_cols cycles later),
@@ -308,9 +374,17 @@ def gen_kernelslist(args):
     # K groups each produce num_loops * tile_rows output elements
     output_size = K * args.num_loops * args.tile_rows * elem_bytes
 
+    # Custom SRAM at memory controller (for --matrix-path noc)
+    tile_elems = args.tile_rows * args.tile_cols
+    bufs_per_sm = 2 if K == 1 else 1
+    matrix_sram_size = bufs_per_sm * tile_elems * elem_bytes
+
     lines = []
     lines.append(f"MemcpyHtoD,0x00007f0010000000,{vector_size}")
     lines.append(f"MemcpyHtoD,0x00007f0020000000,{output_size}")
+    if args.matrix_path == 'noc':
+        # Register the SRAM address range so the simulator knows about it
+        lines.append(f"MemcpyHtoD,0x00007f0030000000,{matrix_sram_size}")
     lines.append("kernel-1.traceg")
     return lines
 
@@ -322,28 +396,53 @@ def print_summary(args):
     tile_elems = args.tile_rows * args.tile_cols
     total_tiles = args.num_loops * args.num_tiles
     bufs_per_sm = 2 if K == 1 else 1
-    matrix_shmem = bufs_per_sm * tile_elems * elem_bytes
+    matrix_via_noc = (args.matrix_path == 'noc')
+
+    if matrix_via_noc:
+        matrix_shmem = 0
+        matrix_sram_bytes = bufs_per_sm * tile_elems * elem_bytes
+    else:
+        matrix_shmem = bufs_per_sm * tile_elems * elem_bytes
+        matrix_sram_bytes = 0
     vec_shmem = args.tile_cols * elem_bytes if args.vector_in_sram else 0
     shmem_per_sm = matrix_shmem + vec_shmem
     total_blocks = args.num_blocks * K
     warps = args.threads_per_block // 32
     rows_per_warp = max(1, args.tile_rows // warps)
-    if args.vector_in_sram:
+
+    if matrix_via_noc:
+        if args.vector_in_sram:
+            mat_inst = "LDG.E.128.BYPASS → custom SRAM via NoC"
+            vec_inst = "LDS.128 (~2cy, inline)"
+            insts_per_tile_per_warp = rows_per_warp * args.tile_cols * 6 + 1
+        else:
+            mat_inst = "LDG.E.128.BYPASS → custom SRAM via NoC"
+            vec_inst = "LDG.E.128 → DRAM via NoC (inline)"
+            insts_per_tile_per_warp = rows_per_warp * args.tile_cols * 6 + 1
+    elif args.vector_in_sram:
+        mat_inst = "LDS.128 (~2cy, inline)"
         vec_inst = "LDS.128 (~2cy, inline)"
-        insts_per_tile_per_warp = rows_per_warp * args.tile_cols * 6 + 1  # BAR + R×C×(LDS_mat+LDS_vec+4×IMAD)
+        insts_per_tile_per_warp = rows_per_warp * args.tile_cols * 6 + 1
     else:
         nregs_needed = 10 + args.tile_cols * 4 + 4
+        mat_inst = "LDS.128 (~2cy, inline)"
         vec_inst = f"LDG.E.128 → R10..R{10+args.tile_cols*4-1} (prefetch {args.tile_cols} elems, {nregs_needed} regs)"
-        insts_per_tile_per_warp = args.tile_cols + rows_per_warp * args.tile_cols * 5 + 1  # BAR + C×LDG_prefetch + R×C×(LDS_mat+4×IMAD)
+        insts_per_tile_per_warp = args.tile_cols + rows_per_warp * args.tile_cols * 5 + 1
 
     mode = "double-buffer (K=1)" if K == 1 else f"{K}-group pipeline"
+    path = "NoC→SRAM" if matrix_via_noc else "instant (LDS)"
     print(f"\n{'='*62}")
-    print(f"  TRACE CONFIG  [{mode}]")
+    print(f"  TRACE CONFIG  [{mode}]  matrix-path={path}")
     print(f"{'='*62}")
     print(f"  SM groups:       {K}  ×  {args.num_blocks} SMs  =  {total_blocks} total blocks")
-    print(f"  SRAM / SM:       {shmem_per_sm} bytes  ({bufs_per_sm} matrix buf{'s' if bufs_per_sm>1 else ''}" +
-          (f" + {vec_shmem}B vec slot" if args.vector_in_sram else "") + ")")
+    if matrix_via_noc:
+        print(f"  Shmem / SM:      {shmem_per_sm} bytes  (vec only, matrix in ext SRAM)")
+        print(f"  Ext SRAM:        {matrix_sram_bytes} bytes  ({bufs_per_sm} buf{'s' if bufs_per_sm>1 else ''} @ mem controller)")
+    else:
+        print(f"  SRAM / SM:       {shmem_per_sm} bytes  ({bufs_per_sm} matrix buf{'s' if bufs_per_sm>1 else ''}" +
+              (f" + {vec_shmem}B vec slot" if args.vector_in_sram else "") + ")")
     print(f"  Tile:            {args.tile_rows}×{args.tile_cols} int128  = {tile_elems*elem_bytes} bytes")
+    print(f"  Matrix source:   {mat_inst}")
     print(f"  Vector source:   {vec_inst}")
     print(f"  Tiles/loop:      {args.num_tiles}    Loops: {args.num_loops}    Total tiles/group: {total_tiles}")
     print(f"  Insts/tile/warp: {insts_per_tile_per_warp}")
@@ -379,6 +478,12 @@ def main():
     parser.add_argument("--vector-in-sram", action="store_true",
                         help="Place vector slice in SRAM (LDS ~2cy) instead of DRAM (LDG ~200cy). "
                              "Eliminates W0_Scoreboard stalls and W32 BAR divergence.")
+    parser.add_argument("--matrix-path", type=str, default="instant",
+                        choices=["instant", "noc"],
+                        help="Matrix loading path: "
+                             "'instant' = LDS from per-SM shared memory (default), "
+                             "'noc' = LDG.E.128.BYPASS through NoC to custom SRAM at memory controller "
+                             "(models realistic NoC congestion + SRAM latency)")
     parser.add_argument("--gpu", type=str, default="a100", choices=["a100", "v100"],
                         help="Target GPU for binary_version in trace header (default: a100)")
     parser.add_argument("--outdir", type=str,
